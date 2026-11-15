@@ -166,6 +166,7 @@ async fn vg360_incident_evidence_end_to_end() {
             compat_signatures: true,
             compat_key: Some(HybridKey::from_seed(ORIGIN, &LOG_SEED)),
             ts: None,
+            ha: None,
         },
     );
     spawn_checkpointer(app.clone());

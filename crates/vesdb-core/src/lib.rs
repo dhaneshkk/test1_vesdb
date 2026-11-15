@@ -17,6 +17,7 @@ pub mod checkpoint;
 pub mod crypto;
 pub mod encoding;
 pub mod merkle;
+pub mod objects;
 pub mod time;
 pub mod ts;
 pub mod validate;

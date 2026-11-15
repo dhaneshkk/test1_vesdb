@@ -132,6 +132,48 @@ on, write throughput is set by the disk's fsync rate: send points in batches.
 Limits: values must be finite, times at or after the Unix epoch, series names are subject paths of
 `[A-Za-z0-9_-]` segments. EventQL cannot read raw points yet, only chunk summaries.
 
+## High availability
+
+One writer, one or more standbys, one shared bucket (`--storage s3://bucket/prefix`; also
+`gs://`, `az://`, `file:///dir`, `memory:///`). The bucket's create-only-if-new write is the only
+thing that decides who writes; there is no consensus code and no lease service.
+
+| object | contents | rule |
+|---|---|---|
+| `log/<position>.batch` | one write batch: metadata, commitments, signed receipt, idempotency key | create only if new (Object Lock, compliance mode) |
+| `data/<commitment>` | one event's salt and data | create only if new; replaced on redaction (no lock, no versioning) |
+| `cp/<size>.json`, `cp/<size>/<witness>.sig` | checkpoint, then each cosignature | create only if new (Object Lock) |
+| `snap/<position>.snap` | in-memory state up to a position | create only if new; old ones may expire |
+| `ts/chunks/…` | sealed time-series chunk files | create only if new; deleted by logged retention |
+| `writer.json` | who writes, heartbeat (advisory) | replaced with `If-Match` |
+
+A write: check preconditions, sign the receipt over the new root, upload payloads, create
+`log/<position>.batch`. Accepted: apply and acknowledge. Refused: another server wrote that
+position, so this one steps down, catches up and answers `503` with `Retry-After`. The client
+retries with the same `Idempotency-Key` header; a key already in the log is answered from the log
+(`idempotent-replayed: true`), a key reused with a different body is refused.
+
+Standbys tail the bucket every `--tail-interval-ms` (200), apply stored batches without re-running
+any write (each receipt is checked against the standby's own tree), serve reads, and keep their
+time-series index current. In `--role auto` a standby claims `writer.json` when the heartbeat is
+older than `--stale-after-ms` (10,000), catches up and writes at the next position. Load
+balancers use `/health/writer` (200 only on the writer) and `/health/ready`.
+
+```
+vesdb run --storage s3://bucket/vesdb --role auto --identity "$HOSTNAME" --data-directory /var/lib/vesdb ...
+vesdb migrate --from /var/lib/vesdb-files --to s3://bucket/vesdb --signing-key-file log.key
+vesdb-verify bucket s3://bucket/vesdb --log-key log.key.pub --witness-key w.pub
+vesdb-verify race-test s3://bucket/race-check --rounds 10000
+```
+
+Measured here (debug build): takeover 0.8–1.0 s after the writer stops with a 1 s stale timeout
+(in-process test), 2.6 s with 3 s (two processes, SIGKILL); with the 10 s default expect 10–12 s.
+
+Not covered: a second region (recovery from a replicated bucket is a manual step); unsealed
+time-series points of the open window are in the failed writer's local write-ahead log and are
+lost with it (sealed chunks survive); restart reads one snapshot plus the batches after it, but
+the snapshot itself holds all event metadata, so its size grows with the log.
+
 ## EventQL on DataFusion
 
 `vesdb-eventql` parses EventQL (FROM … IN events/subjects/eventtypes/(subquery), WHERE, ORDER BY,
@@ -176,8 +218,10 @@ sources, cartesian joins) is implemented and tested.
 | store | atomic batches, preconditions, torn-tail truncation, damaged-file refusal, disk edit with recomputed CRC detected by `verify`, durable redaction with bytes gone from disk |
 | EventQL | 18 tests: the documentation's example queries, guards, grouping order, HAVING with date buckets, aggregates and their failure cases, paths, casts, functions, DISTINCT/SKIP/TOP, subjects/eventtypes sources, boolean preconditions, plan shape |
 | time series (`crates/vesdb-ts`, `crates/vesdb-server/tests/ts.rs`) | Gorilla round trip for arbitrary bit patterns (proptest, incl. NaN payloads, ±0, i64 extremes) and rejection of truncated input; sealing, late and out-of-order points; crash before and after the chunk event; torn and damaged WAL; a rewritten chunk detected on read and by verify-store; retention with exact aggregates from summaries and a restart; over HTTP with a witness, a point proof that verifies and fails for a changed value, a moved index or a foreign witness key |
+| high availability (`crates/vesdb-store/src/ha_tests.rs`, `tests/fault_injection.rs`, `crates/vesdb-server/tests/failover.rs`, `scripts/ha_smoke.sh`) | race test (exactly one winner in each of 2,000 concurrent rounds, in-memory and local directory; `vesdb-verify race-test` for S3 and RustFS); a second writer losing the race, stepping down and catching up; idempotency across servers and restarts; snapshots (1,000 events reopened with ≤ 101 reads); redaction on objects; a forged batch refused; a model check of random writes, retries, tails, restarts, pauses and redactions on three servers asserting the Lean `VesdbStore` statements after every step; failover with the writer killed and with the writer paused but still answering (every acknowledged write present exactly once, in order); sealed time series surviving failover; fault injection scored with MCC: 1.0 over 240 clean and 240 faulty runs (changed byte, deleted batch, deleted payload, forked position, lost acknowledged write, wrong cosignature) |
 | end to end (`crates/vesdb-server/tests/e2e.rs`) | official SDK: ping, token, writes with preconditions, stale write refused, read + `verify_hash` + `verify_signature`, observe history→live, `run_eventql_query`, `is_eventql_query_true` (a DCB rule across subjects); scoped tokens; 2 witnesses; outage and catch-up with one proof; rewritten history with the real log key refused by both witnesses; rollback refused; redaction; bundles verify offline; verify-store; audit-history |
 
+| Lean 4, store (`lean/Store.lean`) | `VesdbStore`: `no_fork`, `views_prefix`, `ack_durable`, `receipt_sound`, `idempotent`, `redaction_keeps_proofs` **proved** for any number of servers sharing a bucket under arbitrary interleavings of writes, tails, restarts and redactions; atomic create-if-new is part of the step semantics, not an axiom (the race test checks real stores); `two_writers_take_turns` shows the model is not vacuous |
 | Lean 4 (`lean/`) | `consistency_sound` and `receipt_binding` **proved**, checked by official Lean 4.25.0 with the core library only (no Mathlib, no `sorry`, standard axioms only; `lean/check.sh`). `lean/Tests.lean` runs the definitions with a toy hash so the theorems are not vacuous: honest proofs verify for every m ≤ n ≤ 24, forked histories fail, RFC 9162 example proof lengths match |
 
 | Rust ↔ Lean (`crates/vesdb-core/tests/lean_vectors.rs`) | the Lean definitions the proof is about, run with SHA-256 (`lean/Sha256.lean`, FIPS 180-4 vectors), produce `lean_vectors.json` (`lean/Vectors.lean`): every root for 0–33 leaves, every consistency and inclusion proof for trees up to 32 leaves, and Lean's verdict on 14,376 honest and tampered cases (flipped, dropped, extra or duplicated proof hashes, wrong roots, leaves, indices and sizes). Rust must match all of them; a deliberately broken Rust verifier fails the test. `lean/check.sh` regenerates the file and fails if the committed copy is stale |
@@ -196,7 +240,7 @@ not proofs.
 
 * Event schemas (`register-event-schema` answers an error); an MCP server.
 * C2SP tlog-tiles static serving (proofs are served by API instead), RFC 3161 timestamping, TLS
-  (terminate at a proxy), Raft/HA, group commit across requests (each request is one fsynced batch),
+  (terminate at a proxy), multi-region replication, group commit across requests (each request is one fsynced batch),
   redb indexes (indexes are rebuilt in memory on start), Windows support (uses Unix file APIs).
 * Key rotation, access events in the log, rate limiting, OpenTelemetry export.
 

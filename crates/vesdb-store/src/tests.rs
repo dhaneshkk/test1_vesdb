@@ -1,5 +1,7 @@
 use super::*;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
+use std::path::Path;
 use vesdb_core::merkle::verify_consistency;
 
 fn cfg(dir: &Path) -> StoreConfig {

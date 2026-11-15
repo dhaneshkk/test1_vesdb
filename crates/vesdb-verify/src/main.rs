@@ -3,6 +3,8 @@
 //! * `bundle`      – checkpoint signatures, witness quorum, each event's commitment, inclusion and
 //!   write-time receipt; optional file hash against a payload field (e.g. a clip).
 //! * `consistency` – a newer checkpoint extends an older one, given a consistency proof.
+//! * `bucket`      – a whole log in object storage: no gaps, every receipt, payload,
+//!   checkpoint, cosignature and snapshot (run nightly and in the quarterly restore test).
 //! * `point`       – one time-series reading: its inclusion in a sealed chunk's `pointsRoot`, and
 //!   that chunk's `chunk-sealed` event in a cosigned checkpoint.
 
@@ -45,6 +47,26 @@ enum Cmd {
         #[arg(long = "file-hash")]
         file_hashes: Vec<String>,
         /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check that a store honours create-only-if-new: two writers create the same key `rounds`
+    /// times concurrently; exactly one must win each time. Run it against every store before
+    /// vesdb uses it (S3, RustFS, a provider's store).
+    RaceTest {
+        storage: String,
+        #[arg(long, default_value_t = 10_000)]
+        rounds: u64,
+    },
+    /// Verify every object of a log in object storage (`s3://bucket/prefix`, `file:///dir`).
+    Bucket {
+        storage: String,
+        #[arg(long)]
+        log_key: PathBuf,
+        #[arg(long = "witness-key")]
+        witness_keys: Vec<PathBuf>,
+        #[arg(long)]
+        quorum: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -171,6 +193,54 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 println!("{}", if rep.ok { "VERIFIED" } else { "NOT VERIFIED" });
             }
             Ok(rep.ok)
+        }
+        Cmd::RaceTest { storage, rounds } => {
+            let b = vesdb_store::ObjectBackend::from_url(&storage)?;
+            let t = std::time::Instant::now();
+            let ok = vesdb_store::backend::race_test(&b, rounds)?;
+            println!(
+                "race test on {storage}: exactly one winner in {ok}/{rounds} rounds ({:?})",
+                t.elapsed()
+            );
+            println!(
+                "{}",
+                if ok == rounds {
+                    "PASSED"
+                } else {
+                    "FAILED: this store must not be used for a shared vesdb log"
+                }
+            );
+            Ok(ok == rounds)
+        }
+        Cmd::Bucket {
+            storage,
+            log_key,
+            witness_keys,
+            quorum,
+            json,
+        } => {
+            let log = load_public(&log_key)?;
+            let wk = witness_keys
+                .iter()
+                .map(|p| load_public(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let k = quorum.unwrap_or(wk.len());
+            let mut b = vesdb_store::ObjectBackend::from_url(&storage)?;
+            let r = vesdb_store::bucket::verify_bucket(&mut b, &log.name, &log, &wk, k)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!(
+                    "bucket {storage}: {} batches, {} events ({} redacted), {} checkpoints ({} with quorum), {} snapshots, writer {}",
+                    r.batches, r.events, r.redacted, r.checkpoints, r.cosigned_checkpoints, r.snapshots,
+                    r.writer.as_deref().unwrap_or("-")
+                );
+                for p in &r.problems {
+                    println!("  PROBLEM: {p}");
+                }
+                println!("{}", if r.ok { "VERIFIED" } else { "NOT VERIFIED" });
+            }
+            Ok(r.ok)
         }
         Cmd::Point {
             proof,

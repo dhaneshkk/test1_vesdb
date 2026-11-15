@@ -60,6 +60,7 @@ async fn start(dir: &Path, witness: &(String, PublicKey)) -> Server {
                 fsync: false,
                 ..TsConfig::new(dir.join("ts"))
             }),
+            ha: None,
         },
     )
     .unwrap();

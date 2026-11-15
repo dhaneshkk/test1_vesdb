@@ -75,7 +75,16 @@ impl TsError {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Shared copy of chunk files (object storage under high availability), so a server that takes
+/// over can read chunks another server sealed. Keys are chunk paths relative to `chunks/`.
+pub trait ChunkMirror: Send + Sync {
+    /// Store a chunk file (create only if new; an existing identical object is fine).
+    fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()>;
+    fn get(&self, key: &str) -> std::io::Result<Option<Vec<u8>>>;
+    fn delete(&self, key: &str) -> std::io::Result<()>;
+}
+
+#[derive(Clone)]
 pub struct TsConfig {
     pub dir: PathBuf,
     /// Sealing window length (ns). Default 60 s.
@@ -90,6 +99,17 @@ pub struct TsConfig {
     pub max_points_per_write: usize,
     /// Delete chunk files whose last point is older than this (ns), logging each deletion.
     pub retention_ns: Option<i64>,
+    pub mirror: Option<std::sync::Arc<dyn ChunkMirror>>,
+}
+
+impl std::fmt::Debug for TsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TsConfig")
+            .field("dir", &self.dir)
+            .field("window_ns", &self.window_ns)
+            .field("mirror", &self.mirror.is_some())
+            .finish()
+    }
 }
 
 impl TsConfig {
@@ -103,6 +123,7 @@ impl TsConfig {
             max_query_points: 1_000_000,
             max_points_per_write: 1_000_000,
             retention_ns: None,
+            mirror: None,
         }
     }
 }
@@ -466,13 +487,13 @@ impl TsEngine {
         Ok((e, findings))
     }
 
-    fn chunk_path(&self, s: &ChunkSummary) -> PathBuf {
+    fn chunk_rel(s: &ChunkSummary) -> String {
         let dir = hex::encode(&sha256(&[s.series.as_bytes()])[..8]);
-        self.cfg
-            .dir
-            .join("chunks")
-            .join(dir)
-            .join(format!("{}-{}.vtsc", s.window, &s.sha256[..16]))
+        format!("{dir}/{}-{}.vtsc", s.window, &s.sha256[..16])
+    }
+
+    fn chunk_path(&self, s: &ChunkSummary) -> PathBuf {
+        self.cfg.dir.join("chunks").join(Self::chunk_rel(s))
     }
 
     /// Delete chunk files of expired chunks and files no committed chunk refers to (a crash
@@ -500,6 +521,51 @@ impl TsEngine {
             }
         }
         Ok(())
+    }
+
+    /// Index `/ts/…` events another server appended (a standby keeping up with the writer).
+    pub fn absorb<'a>(&mut self, log: impl IntoIterator<Item = (u64, &'a str, Option<&'a str>)>) {
+        for (id, ty, data) in log {
+            match (ty, data) {
+                (CHUNK_SEALED_TYPE, Some(d)) => {
+                    let Ok(s) = serde_json::from_str::<ChunkSummary>(d) else {
+                        continue;
+                    };
+                    let v = self.chunks.entry(s.series.clone()).or_default();
+                    if v.iter().any(|c| c.event_id == id) {
+                        continue;
+                    }
+                    let hi = self
+                        .sealed_hi
+                        .entry((s.series.clone(), s.window))
+                        .or_default();
+                    *hi = (*hi).max(s.wal_hi);
+                    self.next_batch = self.next_batch.max(s.wal_hi + 1);
+                    v.push(ChunkRef {
+                        event_id: id,
+                        summary: s,
+                        expired_by: None,
+                    });
+                    v.sort_by_key(|c| (c.summary.t0, c.event_id));
+                }
+                (CHUNK_EXPIRED_TYPE, Some(d)) => {
+                    let Ok(x) = serde_json::from_str::<ChunkExpired>(d) else {
+                        continue;
+                    };
+                    let Ok(chunk) = x.chunk.parse::<u64>() else {
+                        continue;
+                    };
+                    if let Some(c) = self
+                        .chunks
+                        .get_mut(&x.series)
+                        .and_then(|v| v.iter_mut().find(|c| c.event_id == chunk))
+                    {
+                        c.expired_by = Some(id);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn config(&self) -> &TsConfig {
@@ -594,6 +660,10 @@ impl TsEngine {
                 fs::rename(&tmp, &path)?;
                 if self.cfg.fsync {
                     sync_dir(path.parent().unwrap())?;
+                }
+                if let Some(m) = &self.cfg.mirror {
+                    // shared before its event can name it, so any server can read it
+                    m.put(&Self::chunk_rel(&summary), &bytes)?;
                 }
                 out.push(PendingSeal { summary, path });
             }
@@ -707,6 +777,9 @@ impl TsEngine {
             {
                 c.expired_by = Some(id);
                 let summary = c.summary.clone();
+                if let Some(m) = &self.cfg.mirror {
+                    m.delete(&Self::chunk_rel(&summary))?;
+                }
                 let p = self.chunk_path(&summary);
                 match fs::remove_file(&p) {
                     Ok(()) => {}
@@ -726,8 +799,26 @@ impl TsEngine {
             chunk: c.event_id,
             why,
         };
-        let bytes = fs::read(self.chunk_path(&c.summary))
-            .map_err(|e| tampered(format!("chunk file unreadable: {e}")))?;
+        let path = self.chunk_path(&c.summary);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.cfg.mirror.is_some() => {
+                // sealed by another server: fetch the shared copy (checked below like any read)
+                let m = self.cfg.mirror.as_ref().unwrap();
+                let b = m
+                    .get(&Self::chunk_rel(&c.summary))
+                    .map_err(|e| tampered(format!("shared chunk unreadable: {e}")))?
+                    .ok_or_else(|| {
+                        tampered("chunk file missing here and in shared storage".into())
+                    })?;
+                if let Some(d) = path.parent() {
+                    let _ = fs::create_dir_all(d);
+                }
+                let _ = fs::write(&path, &b);
+                b
+            }
+            Err(e) => return Err(tampered(format!("chunk file unreadable: {e}"))),
+        };
         chunk::read(&bytes, &c.summary).map_err(tampered)
     }
 

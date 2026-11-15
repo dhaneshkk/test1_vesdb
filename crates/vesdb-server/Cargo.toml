@@ -37,3 +37,4 @@ vesdb-witness.workspace = true
 eventsourcingdb = "=4.1.4"
 url = "2"
 ed25519-dalek.workspace = true
+object_store.workspace = true

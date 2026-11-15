@@ -149,6 +149,15 @@ pub(crate) async fn write(
     if let Err(r) = engine(&app) {
         return r;
     }
+    if app.store.lock().unwrap().is_standby() {
+        let mut r = status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store-not-writer: this server is a standby",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return r;
+    }
     let b: WriteBody = match parse_body(&headers, &body) {
         Ok(b) => b,
         Err(r) => return r,
@@ -260,6 +269,9 @@ pub fn ts_round(
     let Some(ts) = &app.ts else {
         return Ok(vec![]);
     };
+    if app.store.lock().unwrap().is_standby() {
+        return Ok(vec![]); // only the writer seals
+    }
     let mut eng = ts.lock().unwrap();
     let pending = eng.prepare_seals(now, force).map_err(|e| e.to_string())?;
     let expiries = match eng.config().retention_ns {

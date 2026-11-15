@@ -85,9 +85,15 @@ impl MerkleTree {
     }
 
     /// Remove all leaves at index ≥ `n` (used only to model tampering in tests and recovery).
+    /// Drop leaves `n..`. Level `l` holds only complete subtrees, so it keeps `n >> l` nodes.
     pub fn truncate(&mut self, n: u64) {
-        let leaves: Vec<Hash> = self.levels[0][..n as usize].to_vec();
-        *self = Self::from_leaves(leaves);
+        assert!(n <= self.size());
+        for (l, level) in self.levels.iter_mut().enumerate() {
+            level.truncate((n >> l) as usize);
+        }
+        while self.levels.len() > 1 && self.levels.last().is_some_and(|v| v.is_empty()) {
+            self.levels.pop();
+        }
     }
 
     /// MTH of leaves `[lo, hi)`. Requires the RFC 9162 alignment that every recursive call from

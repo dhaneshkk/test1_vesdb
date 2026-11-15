@@ -33,12 +33,46 @@ enum Cmd {
     },
     /// Run the server.
     Run(Box<Run>),
+    /// Copy a file store into object storage, then check the copy against the source: same
+    /// events, same Merkle root, same receipts and checkpoints.
+    Migrate {
+        /// Source data directory (the server must be stopped).
+        #[arg(long)]
+        from: PathBuf,
+        /// Destination, e.g. `s3://bucket/prefix` (must be empty).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        signing_key_file: PathBuf,
+    },
 }
 
 #[derive(clap::Args)]
 struct Run {
     #[arg(long, conflicts_with = "data_directory_temporary")]
     data_directory: Option<PathBuf>,
+    /// Keep the log in object storage instead of the data directory: `s3://bucket/prefix`,
+    /// `gs://…`, `az://…`, `file:///dir` or `memory:///`. Credentials come from the environment
+    /// (workload identity, `AWS_*`), never from flags. The data directory then holds only local
+    /// time-series state.
+    #[arg(long)]
+    storage: Option<String>,
+    /// With --storage: `writer`, `standby` or `auto` (claim the writer role when it is stale).
+    #[arg(long, default_value = "auto")]
+    role: String,
+    /// With --storage: this server's name in `writer.json` (default: host name and port).
+    #[arg(long)]
+    identity: Option<String>,
+    #[arg(long, default_value_t = 200)]
+    tail_interval_ms: u64,
+    #[arg(long, default_value_t = 2_000)]
+    heartbeat_interval_ms: u64,
+    /// A writer whose heartbeat is older than this is presumed dead.
+    #[arg(long, default_value_t = 10_000)]
+    stale_after_ms: u64,
+    /// With --storage: store a snapshot every N events, so restarts read one object plus the tail.
+    #[arg(long, default_value_t = 10_000)]
+    snapshot_every: u64,
     /// Use a temporary data directory, deleted on shutdown (tests and demos).
     #[arg(long)]
     data_directory_temporary: bool,
@@ -112,6 +146,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Cmd::Run(r) => run(*r).await?,
+        Cmd::Migrate {
+            from,
+            to,
+            signing_key_file,
+        } => {
+            let r = tokio::task::spawn_blocking(move || {
+                vesdb_server::migrate::migrate(&from, &to, &signing_key_file)
+            })
+            .await??;
+            println!("{r}");
+        }
     }
     Ok(())
 }
@@ -164,7 +209,14 @@ async fn run(r: Run) -> Result<(), Box<dyn std::error::Error>> {
     }
     let quorum = r.witness_quorum.unwrap_or(witnesses.len());
     let host = origin.split('/').next().unwrap_or(&origin).to_string();
+    let mirror: Option<std::sync::Arc<dyn vesdb_ts::ChunkMirror>> = match &r.storage {
+        Some(url) => Some(std::sync::Arc::new(vesdb_server::ha::BucketChunks(
+            vesdb_store::ObjectBackend::from_url(url)?,
+        ))),
+        None => None,
+    };
     let ts = (!r.no_time_series).then(|| TsConfig {
+        mirror: mirror.clone(),
         window_ns: (r.ts_window_ms as i64).saturating_mul(1_000_000),
         grace_ns: (r.ts_grace_ms as i64).saturating_mul(1_000_000),
         fsync: !r.ts_no_fsync,
@@ -173,13 +225,34 @@ async fn run(r: Run) -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| (s as i64).saturating_mul(1_000_000_000)),
         ..TsConfig::new(dir.join("ts"))
     });
-    let store = Store::open(StoreConfig {
+    let scfg = StoreConfig {
         dir,
         origin: origin.clone(),
         system_source: r.system_source.unwrap_or(format!("https://{host}")),
         pii_types: r.pii_types.into_iter().collect(),
         key,
-    })?;
+    };
+    let (store, ha) = match &r.storage {
+        None => (Store::open(scfg)?, None),
+        Some(url) => {
+            let b = vesdb_store::ObjectBackend::from_url(url)?;
+            let mut st =
+                tokio::task::spawn_blocking(move || Store::open_with(scfg, Box::new(b))).await??;
+            st.set_snapshot_every(Some(r.snapshot_every));
+            let identity = r.identity.clone().unwrap_or_else(|| {
+                let h = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+                format!("{}:{}", h.trim(), r.listen)
+            });
+            let hc = vesdb_server::ha::HaConfig {
+                role: r.role.parse()?,
+                identity,
+                tail_interval: Duration::from_millis(r.tail_interval_ms),
+                heartbeat_interval: Duration::from_millis(r.heartbeat_interval_ms),
+                stale_after: Duration::from_millis(r.stale_after_ms),
+            };
+            (st, Some((hc, vesdb_store::ObjectBackend::from_url(url)?)))
+        }
+    };
     let app = try_new_app(
         store,
         ServerConfig {
@@ -192,9 +265,13 @@ async fn run(r: Run) -> Result<(), Box<dyn std::error::Error>> {
             compat_signatures: !r.no_compat_signatures,
             compat_key: Some(compat_key),
             ts,
+            ha,
         },
     )?;
     spawn_checkpointer(app.clone());
+    if app.ha.is_some() {
+        vesdb_server::ha::spawn_ha(app.clone());
+    }
     if app.ts.is_some() {
         spawn_sealer(app.clone(), Duration::from_millis(r.ts_seal_interval_ms));
     }

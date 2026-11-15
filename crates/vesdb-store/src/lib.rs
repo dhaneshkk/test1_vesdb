@@ -13,18 +13,27 @@
 //! Write order per batch: payloads → events → fsync both → sign receipt → append + fsync receipt
 //! → acknowledge. Leaves never contain payload bytes, so redaction rewrites `payloads.log` in
 //! place without touching any leaf, root, receipt or checkpoint.
+//!
+//! The same engine runs on object storage ([`backend::ObjectBackend`]): one batch object per
+//! write, created only if new, so two servers can share a bucket and the bucket decides who
+//! writes. A server whose create is refused steps down to standby ([`Store::is_standby`]), catches
+//! up with [`Store::catch_up`] and answers with the retryable [`StoreError::Conflict`].
 
+pub mod backend;
+pub mod bucket;
 pub mod frames;
 
-use std::collections::{BTreeMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+pub use backend::{Backend, FileBackend, ObjectBackend};
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use vesdb_core::{
     bundle::{Bundle, BundleItem, BUNDLE_FORMAT},
     checkpoint::{receipt_message, Checkpoint, Receipt},
     crypto::{HybridKey, PublicKey},
     encoding::{commitment, compat_hash_v2, EventMeta, ZERO_HASH_HEX},
     merkle::MerkleTree,
+    objects::{BatchObject, IdemEntry, IdemRecord, SnapshotObject, SNAPSHOT_FORMAT},
     random_bytes,
     validate::{self, InputError},
     Hash,
@@ -56,6 +65,12 @@ pub enum StoreError {
     UnknownEvent(u64),
     #[error("{0}")]
     Invalid(String),
+    #[error("writer-conflict: another server wrote position {position}; this one stepped down")]
+    Conflict { position: u64 },
+    #[error("store-not-writer: this server is a standby")]
+    NotWriter,
+    #[error("idempotency-key-reused: the key was used for a different request")]
+    IdempotencyMismatch,
 }
 
 impl StoreError {
@@ -71,8 +86,28 @@ impl StoreError {
             StoreError::Locked => "store-locked".into(),
             StoreError::UnknownEvent(_) => "event-id-unknown".into(),
             StoreError::Invalid(_) => "request-invalid".into(),
+            StoreError::Conflict { .. } => "writer-conflict".into(),
+            StoreError::NotWriter => "store-not-writer".into(),
+            StoreError::IdempotencyMismatch => "idempotency-key-reused".into(),
         }
     }
+
+    /// The client may retry the same request (with its idempotency key) on another server.
+    pub fn retryable(&self) -> bool {
+        matches!(self, StoreError::Conflict { .. } | StoreError::NotWriter)
+    }
+}
+
+/// How long idempotency keys are remembered.
+pub const IDEMPOTENCY_WINDOW_NS: u64 = 24 * 3600 * 1_000_000_000;
+
+/// Result of [`Store::write_ext`].
+#[derive(Clone, Debug)]
+pub struct WriteOutcome {
+    pub events: Vec<EventMeta>,
+    pub receipt: Receipt,
+    /// The idempotency key was seen before: these are the original events, nothing was written.
+    pub replayed: bool,
 }
 
 /// An event as submitted by a client.
@@ -140,12 +175,6 @@ pub struct StoredEvent {
     pub payload: Option<(Hash, String)>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PayloadSlot {
-    offset: u64,
-    redacted: bool,
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Finding {
     pub severity: &'static str,
@@ -163,177 +192,264 @@ pub struct StoreConfig {
     pub key: HybridKey,
 }
 
-struct Files {
-    events: File,
-    payloads: File,
-    receipts: File,
-    checkpoints: File,
-    _lock: File,
-}
-
 pub struct Store {
     cfg: StoreConfig,
-    files: Files,
+    backend: Box<dyn Backend>,
     events: Vec<EventMeta>,
     tree: MerkleTree,
-    slots: Vec<PayloadSlot>,
+    redacted: Vec<bool>,
     by_subject: BTreeMap<String, Vec<u64>>,
     receipts: Vec<Receipt>,
     checkpoints: Vec<Checkpoint>,
+    idem: HashMap<String, IdemEntry>,
     read_only: bool,
+    standby: bool,
     failed: Option<String>,
     /// bumps on every redaction (lets caches of payloads know they are stale)
     redactions: u64,
-}
-
-/// Read/write WITHOUT `O_APPEND`: on Linux `pwrite` ignores the offset on an O_APPEND file, which
-/// would turn in-place redaction into an append. [`frames::append`] seeks to the end explicitly.
-fn open_rw(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-fn set_mode(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640));
-}
-
-/// Load a framed file, truncating a torn tail; refuses damaged files.
-fn load_frames(file: &mut File, name: &str) -> Result<Vec<frames::Frame>, StoreError> {
-    let scan = frames::scan(file)?;
-    if scan.damaged {
-        return Err(StoreError::Damaged(format!(
-            "{name}: bad frame at offset {} followed by more data",
-            scan.good_len
-        )));
-    }
-    if scan.trailing > 0 {
-        file.set_len(scan.good_len)?;
-        file.sync_all()?;
-    }
-    Ok(scan.frames)
+    snapshot_every: Option<u64>,
+    last_snapshot: u64,
+    load_reads: u64,
 }
 
 impl Store {
+    /// Open the file store in `cfg.dir`.
     pub fn open(cfg: StoreConfig) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(&cfg.dir)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cfg.dir, std::fs::Permissions::from_mode(0o750));
-        }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(cfg.dir.join("lock.vesdb"))?;
-        if lock.try_lock().is_err() {
-            return Err(StoreError::Locked);
-        }
-        let mut files = Files {
-            events: open_rw(&cfg.dir.join("events.log"))?,
-            payloads: open_rw(&cfg.dir.join("payloads.log"))?,
-            receipts: open_rw(&cfg.dir.join("receipts.log"))?,
-            checkpoints: open_rw(&cfg.dir.join("checkpoints.log"))?,
-            _lock: lock,
-        };
-        for f in [
-            "events.log",
-            "payloads.log",
-            "receipts.log",
-            "checkpoints.log",
-            "lock.vesdb",
-        ] {
-            set_mode(&cfg.dir.join(f));
-        }
+        let b = FileBackend::open(&cfg.dir)?;
+        Self::open_with(cfg, Box::new(b))
+    }
 
-        // events
-        let mut events = Vec::new();
-        for (i, fr) in load_frames(&mut files.events, "events.log")?
-            .into_iter()
-            .enumerate()
-        {
-            let m: EventMeta = serde_json::from_slice(&fr.body)
-                .map_err(|e| StoreError::Damaged(format!("events.log frame {i}: {e}")))?;
-            if m.id != i as u64 {
-                return Err(StoreError::Damaged(format!(
-                    "events.log: frame {i} carries id {}",
-                    m.id
-                )));
-            }
-            events.push(m);
-        }
-        // payloads: one per event, in order; extra (unacknowledged) payloads are dropped
-        let pframes = load_frames(&mut files.payloads, "payloads.log")?;
-        if pframes.len() < events.len() {
-            return Err(StoreError::Damaged(format!(
-                "payloads.log has {} payloads for {} events",
-                pframes.len(),
-                events.len()
-            )));
-        }
-        let mut slots = Vec::with_capacity(events.len());
-        for (i, fr) in pframes.iter().enumerate().take(events.len()) {
-            let id = u64::from_be_bytes(fr.body[..8].try_into().unwrap());
-            if id != i as u64 {
-                return Err(StoreError::Damaged(format!(
-                    "payloads.log frame {i} carries id {id}"
-                )));
-            }
-            slots.push(PayloadSlot {
-                offset: fr.offset,
-                redacted: fr.body[8] == 1,
-            });
-        }
-        if pframes.len() > events.len() {
-            files.payloads.set_len(pframes[events.len()].offset)?;
-            files.payloads.sync_all()?;
-        }
-        let mut receipts: Vec<Receipt> = Vec::new();
-        for fr in load_frames(&mut files.receipts, "receipts.log")? {
-            let r: Receipt = serde_json::from_slice(&fr.body)
-                .map_err(|e| StoreError::Damaged(format!("receipts.log: {e}")))?;
-            if r.size <= events.len() as u64 {
-                receipts.push(r);
-            }
-        }
-        let mut checkpoints = Vec::new();
-        for fr in load_frames(&mut files.checkpoints, "checkpoints.log")? {
-            let c: Checkpoint = serde_json::from_slice(&fr.body)
-                .map_err(|e| StoreError::Damaged(format!("checkpoints.log: {e}")))?;
-            if c.size <= events.len() as u64 {
-                checkpoints.push(c);
-            }
-        }
-
-        let tree = MerkleTree::from_leaves(events.iter().map(|e| e.leaf()));
+    /// Open on any backend. A shared backend (object storage) opens as a standby: call
+    /// [`Store::become_writer`] once this server is the writer.
+    pub fn open_with(cfg: StoreConfig, mut backend: Box<dyn Backend>) -> Result<Self, StoreError> {
+        let l = backend.load()?;
+        let mut tree = MerkleTree::new();
         let mut by_subject: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for e in &events {
+        for e in &l.events {
+            tree.push(e.leaf());
             by_subject.entry(e.subject.clone()).or_default().push(e.id);
         }
+        let standby = backend.shared();
         let mut store = Store {
             cfg,
-            files,
-            events,
+            backend,
             tree,
-            slots,
+            redacted: l.redacted,
             by_subject,
-            receipts,
-            checkpoints,
+            receipts: l.receipts,
+            checkpoints: l.checkpoints,
+            idem: l.idem.into_iter().map(|e| (e.key.clone(), e)).collect(),
+            events: l.events,
             read_only: false,
+            standby,
             failed: None,
             redactions: 0,
+            snapshot_every: None,
+            last_snapshot: 0,
+            load_reads: l.reads,
         };
-        // Durable but un-receipted tail (crash after event fsync): issue its receipt now.
+        store.last_snapshot = store.len();
+        // On a shared store, refuse to serve (or extend) a log whose receipts do not match its
+        // events. A file store opens anyway, so `verify-store` can report what changed.
+        let shared = store.backend.shared();
+        for r in store.receipts.iter().filter(|_| shared) {
+            if r.size > store.len()
+                || store.tree.root_at(r.size) != r.root
+                || !r.verify(&store.cfg.origin, &store.cfg.key.public())
+            {
+                return Err(StoreError::Damaged(format!(
+                    "receipt size {} does not match the log",
+                    r.size
+                )));
+            }
+        }
+        // Durable but un-receipted tail (file store, crash after event fsync): issue its receipt.
         let n = store.events.len() as u64;
         if n > 0 && store.receipts.last().map(|r| r.size) != Some(n) {
             store.issue_receipt()?;
         }
         Ok(store)
+    }
+
+    /// Write a snapshot to the backend every `n` events (object stores; no-op for files).
+    pub fn set_snapshot_every(&mut self, n: Option<u64>) {
+        self.snapshot_every = n.filter(|&n| n > 0);
+    }
+
+    /// Objects (or files) read at open: the restart cost.
+    pub fn load_reads(&self) -> u64 {
+        self.load_reads
+    }
+
+    pub fn backend_description(&self) -> String {
+        self.backend.describe()
+    }
+
+    // ---------------------------------------------------------------- roles
+
+    pub fn is_standby(&self) -> bool {
+        self.standby
+    }
+
+    /// Step down: stop accepting writes (another server writes now).
+    pub fn step_down(&mut self) {
+        self.standby = true;
+    }
+
+    /// Catch up with everything stored, then accept writes at the next position.
+    pub fn become_writer(&mut self) -> Result<u64, StoreError> {
+        self.catch_up()?;
+        self.standby = false;
+        Ok(self.len())
+    }
+
+    /// Apply batches (and checkpoints) stored since this server's last position. Returns the
+    /// number of events applied. The standby never re-runs a write: it loads the bytes the
+    /// writer stored and checks each receipt against its own tree.
+    pub fn catch_up(&mut self) -> Result<u64, StoreError> {
+        let before = self.len();
+        for b in self.backend.tail(self.len())? {
+            self.apply_batch(b)?;
+        }
+        let after = self
+            .checkpoints
+            .last()
+            .map_or(0, |c| c.size.saturating_sub(1));
+        for cp in self.backend.checkpoints_after(after)? {
+            if cp.size > self.len() {
+                continue;
+            }
+            match self.checkpoints.iter_mut().find(|c| c.size == cp.size) {
+                Some(c) => c.cosigs.extend(cp.cosigs),
+                None => self.checkpoints.push(cp),
+            }
+        }
+        self.checkpoints.sort_by_key(|c| c.size);
+        Ok(self.len() - before)
+    }
+
+    /// Apply one stored batch (Lean: `VesdbStore.apply`): it must start at this store's length,
+    /// and its receipt must be signed by the log key over this store's new root.
+    pub fn apply_batch(&mut self, b: BatchObject) -> Result<(), StoreError> {
+        if b.first != self.len() {
+            return Err(StoreError::Damaged(format!(
+                "batch {} applied at position {}",
+                b.first,
+                self.len()
+            )));
+        }
+        if !b.receipt.verify(&self.cfg.origin, &self.public_key()) {
+            return Err(StoreError::Damaged(format!(
+                "batch {}: receipt signature invalid",
+                b.first
+            )));
+        }
+        let base = self.len();
+        for e in &b.events {
+            self.tree.push(e.leaf());
+        }
+        if self.tree.root_at(self.len_tree()) != b.receipt.root {
+            self.tree.truncate(base);
+            return Err(StoreError::Damaged(format!(
+                "batch {}: receipt root does not match the events",
+                b.first
+            )));
+        }
+        if let Some(r) = &b.idem {
+            self.idem.insert(
+                r.key.clone(),
+                IdemEntry {
+                    key: r.key.clone(),
+                    request: r.request.clone(),
+                    first: b.first,
+                    count: b.events.len() as u64,
+                    time_ns: b.events[0].time_ns,
+                },
+            );
+        }
+        let redaction_done: Vec<u64> = b
+            .events
+            .iter()
+            .filter(|e| e.ty == T_REDACTION_COMPLETED)
+            .map(|e| e.id)
+            .collect();
+        for e in b.events {
+            self.by_subject
+                .entry(e.subject.clone())
+                .or_default()
+                .push(e.id);
+            self.redacted.push(false);
+            self.events.push(e);
+        }
+        self.receipts.push(b.receipt);
+        for id in redaction_done {
+            if let Ok(StoredEvent {
+                payload: Some((_, d)),
+                ..
+            }) = self.event(id)
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&d) {
+                    for i in v["ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|x| x.as_u64())
+                    {
+                        if let Some(r) = self.redacted.get_mut(i as usize) {
+                            *r = true;
+                        }
+                    }
+                    self.redactions += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw payload body `[u64 id][u8 flag][32 salt][data]` (migration).
+    pub fn payload_body(&self, id: u64) -> Result<Vec<u8>, StoreError> {
+        let m = self
+            .events
+            .get(id as usize)
+            .ok_or(StoreError::UnknownEvent(id))?;
+        self.backend.read_body(id, m)
+    }
+
+    /// Idempotency key of the batch starting at `first`, if any.
+    pub fn idem_for(&self, first: u64) -> Option<IdemRecord> {
+        self.idem
+            .values()
+            .find(|e| e.first == first)
+            .map(|e| IdemRecord {
+                key: e.key.clone(),
+                request: e.request.clone(),
+            })
+    }
+
+    fn len_tree(&self) -> u64 {
+        self.tree.size()
+    }
+
+    /// Store a snapshot of the in-memory state (object stores read it at restart).
+    pub fn snapshot(&mut self) -> Result<u64, StoreError> {
+        let s = SnapshotObject {
+            format: SNAPSHOT_FORMAT.into(),
+            size: self.len(),
+            events: self.events.clone(),
+            receipts: self.receipts.clone(),
+            redacted: self
+                .redacted
+                .iter()
+                .enumerate()
+                .filter(|(_, &r)| r)
+                .map(|(i, _)| i as u64)
+                .collect(),
+            idem: self.idem.values().cloned().collect(),
+            root: self.tree.root_at(self.len()),
+        };
+        self.backend.put_snapshot(&s)?;
+        self.last_snapshot = s.size;
+        Ok(s.size)
     }
 
     // ---------------------------------------------------------------- accessors
@@ -388,15 +504,22 @@ impl Store {
             .get(id as usize)
             .ok_or(StoreError::UnknownEvent(id))?
             .clone();
-        let slot = self.slots[id as usize];
-        let payload = if slot.redacted {
+        let payload = if self.redacted[id as usize] {
             None
         } else {
-            let body = frames::read_body(&self.files.payloads, slot.offset)?;
-            let salt: Hash = body[9..41].try_into().unwrap();
-            let data = String::from_utf8(body[41..].to_vec())
-                .map_err(|e| StoreError::Damaged(e.to_string()))?;
-            Some((salt, data))
+            let body = self.backend.read_body(id, &meta)?;
+            if body.len() < 9 || body[8] == 1 {
+                None // redacted (the body's flag is authoritative)
+            } else if body.len() < 41 {
+                return Err(StoreError::Damaged(format!(
+                    "event {id}: payload body truncated"
+                )));
+            } else {
+                let salt: Hash = body[9..41].try_into().unwrap();
+                let data = String::from_utf8(body[41..].to_vec())
+                    .map_err(|e| StoreError::Damaged(e.to_string()))?;
+                Some((salt, data))
+            }
         };
         Ok(StoredEvent { meta, payload })
     }
@@ -462,6 +585,9 @@ impl Store {
         if let Some(f) = &self.failed {
             return Err(StoreError::Failed(f.clone()));
         }
+        if self.standby {
+            return Err(StoreError::NotWriter);
+        }
         if self.read_only {
             return Err(StoreError::ReadOnly);
         }
@@ -476,10 +602,18 @@ impl Store {
             .key
             .sign(&receipt_message(&self.cfg.origin, n, &root));
         let r = Receipt { size: n, root, sig };
-        frames::append(&mut self.files.receipts, &serde_json::to_vec(&r).unwrap())?;
-        self.files.receipts.sync_data()?;
+        self.backend.store_receipt(&r)?;
         self.receipts.push(r.clone());
         Ok(r)
+    }
+
+    fn sign_receipt(&self, n: u64) -> Receipt {
+        let root = self.tree.root_at(n);
+        let sig = self
+            .cfg
+            .key
+            .sign(&receipt_message(&self.cfg.origin, n, &root));
+        Receipt { size: n, root, sig }
     }
 
     /// One atomic write (Lean: `Vesdb.append`): all events or none, preconditions evaluated
@@ -491,6 +625,39 @@ impl Store {
         cands: Vec<Candidate>,
         pcs: &[Precondition],
     ) -> Result<(Vec<EventMeta>, Receipt), StoreError> {
+        let o = self.write_ext(now_ns, cands, pcs, None)?;
+        Ok((o.events, o.receipt))
+    }
+
+    /// [`Store::write`] with an optional idempotency key (Lean: `VesdbStore.idempotent`): a key
+    /// seen within [`IDEMPOTENCY_WINDOW_NS`] returns the original events and receipt and writes
+    /// nothing; the same key with a different request is refused.
+    pub fn write_ext(
+        &mut self,
+        now_ns: u64,
+        cands: Vec<Candidate>,
+        pcs: &[Precondition],
+        idem: Option<IdemRecord>,
+    ) -> Result<WriteOutcome, StoreError> {
+        if let Some(r) = &idem {
+            if let Some(e) = self.idem.get(&r.key) {
+                if now_ns.saturating_sub(e.time_ns) <= IDEMPOTENCY_WINDOW_NS {
+                    if e.request != r.request {
+                        return Err(StoreError::IdempotencyMismatch);
+                    }
+                    let events =
+                        self.events[e.first as usize..(e.first + e.count) as usize].to_vec();
+                    let receipt = self.receipt_for(e.first).cloned().ok_or_else(|| {
+                        StoreError::Damaged("receipt missing for a stored batch".into())
+                    })?;
+                    return Ok(WriteOutcome {
+                        events,
+                        receipt,
+                        replayed: true,
+                    });
+                }
+            }
+        }
         self.ensure_writable()?;
         if cands.is_empty() {
             return Err(StoreError::EventsMissing);
@@ -560,46 +727,62 @@ impl Store {
             metas.push(m);
         }
 
-        // persist: payloads, events, fsync; on any failure roll files back and fail the store
-        let ev_len0 = self.files.events.metadata()?.len();
-        let pay_len0 = self.files.payloads.metadata()?.len();
-        let res: std::io::Result<Vec<u64>> = (|| {
-            let mut offs = Vec::with_capacity(pay_bodies.len());
-            for b in &pay_bodies {
-                offs.push(frames::append(&mut self.files.payloads, b)?);
-            }
-            for m in &metas {
-                frames::append(&mut self.files.events, &serde_json::to_vec(m).unwrap())?;
-            }
-            self.files.payloads.sync_data()?;
-            self.files.events.sync_data()?;
-            Ok(offs)
-        })();
-        let offs = match res {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = self.files.events.set_len(ev_len0);
-                let _ = self.files.payloads.set_len(pay_len0);
-                self.failed = Some(format!("write failed: {e}"));
-                return Err(StoreError::Failed(e.to_string()));
-            }
-        };
-        for (m, off) in metas.iter().zip(offs) {
+        // the new root and its signed receipt, then one durable batch
+        for m in &metas {
             self.tree.push(m.leaf());
-            self.slots.push(PayloadSlot {
-                offset: off,
-                redacted: false,
-            });
+        }
+        let n = base + metas.len() as u64;
+        let receipt = self.sign_receipt(n);
+        let batch = backend::Batch {
+            first: base,
+            events: &metas,
+            bodies: &pay_bodies,
+            receipt: &receipt,
+            idem: idem.as_ref(),
+            time_ns: t,
+        };
+        if let Err(e) = self.backend.append(&batch) {
+            self.tree.truncate(base);
+            match e {
+                StoreError::Conflict { .. } => self.standby = true,
+                _ => self.failed = Some(format!("write failed: {e}")),
+            }
+            return Err(e);
+        }
+        for m in &metas {
+            self.redacted.push(false);
             self.by_subject
                 .entry(m.subject.clone())
                 .or_default()
                 .push(m.id);
             self.events.push(m.clone());
         }
-        let receipt = self
-            .issue_receipt()
-            .inspect_err(|e| self.failed = Some(format!("receipt failed: {e}")))?;
-        Ok((metas, receipt))
+        self.receipts.push(receipt.clone());
+        if let Some(r) = idem {
+            self.idem
+                .retain(|_, e| t.saturating_sub(e.time_ns) <= IDEMPOTENCY_WINDOW_NS);
+            self.idem.insert(
+                r.key.clone(),
+                IdemEntry {
+                    key: r.key,
+                    request: r.request,
+                    first: base,
+                    count: metas.len() as u64,
+                    time_ns: t,
+                },
+            );
+        }
+        if let Some(k) = self.snapshot_every {
+            if self.len() - self.last_snapshot >= k {
+                // best effort: a missing snapshot only slows the next restart
+                let _ = self.snapshot();
+            }
+        }
+        Ok(WriteOutcome {
+            events: metas,
+            receipt,
+            replayed: false,
+        })
     }
 
     // ---------------------------------------------------------------- reads
@@ -665,19 +848,14 @@ impl Store {
             &[],
         )?;
         for &i in ids {
-            let slot = self.slots[i as usize];
-            if slot.redacted {
+            if self.redacted[i as usize] {
                 continue;
             }
-            let mut body = frames::read_body(&self.files.payloads, slot.offset)?;
-            body[8] = 1;
-            for b in body[9..].iter_mut() {
-                *b = 0;
-            }
-            frames::rewrite(&self.files.payloads, slot.offset, &body)?;
-            self.slots[i as usize].redacted = true;
+            let meta = self.events[i as usize].clone();
+            self.backend.redact(i, &meta)?;
+            self.redacted[i as usize] = true;
         }
-        self.files.payloads.sync_data()?;
+        self.backend.sync_redactions()?;
         self.redactions += 1;
         self.write(
             now_ns,
@@ -708,11 +886,7 @@ impl Store {
 
     /// Persist a checkpoint (again) after cosignatures were added.
     pub fn record_checkpoint(&mut self, cp: Checkpoint) -> Result<(), StoreError> {
-        frames::append(
-            &mut self.files.checkpoints,
-            &serde_json::to_vec(&cp).unwrap(),
-        )?;
-        self.files.checkpoints.sync_data()?;
+        self.backend.put_checkpoint(&cp)?;
         if let Some(last) = self.checkpoints.last_mut() {
             if last.size == cp.size && last.root == cp.root {
                 *last = cp;
@@ -838,3 +1012,6 @@ pub use frames::Scan;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ha_tests;

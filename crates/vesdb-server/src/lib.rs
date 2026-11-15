@@ -12,6 +12,8 @@
 
 #![allow(clippy::result_large_err, clippy::type_complexity)]
 
+pub mod ha;
+pub mod migrate;
 pub mod ts;
 pub mod wire;
 
@@ -84,6 +86,9 @@ pub struct ServerConfig {
     pub compat_key: Option<HybridKey>,
     /// Enable the time-series engine.
     pub ts: Option<vesdb_ts::TsConfig>,
+    /// High availability on a shared bucket: role settings and a handle on the same bucket the
+    /// store uses (for `writer.json`).
+    pub ha: Option<(ha::HaConfig, vesdb_store::ObjectBackend)>,
 }
 
 /// Columnar copy of the log for EventQL. Append-only like the log; rebuilt after a redaction.
@@ -105,6 +110,7 @@ pub struct App {
     pub origin: String,
     pub log_key: PublicKey,
     pub ts: Option<Mutex<vesdb_ts::TsEngine>>,
+    pub ha: Option<ha::Ha>,
 }
 
 pub type Shared = Arc<App>;
@@ -119,9 +125,11 @@ pub fn try_new_app(store: Store, mut cfg: ServerConfig) -> Result<Shared, String
         Some(c) => Some(Mutex::new(ts::open_engine(c, &store)?)),
         None => None,
     };
+    let ha = cfg.ha.take().map(|(c, b)| ha::Ha::new(c, b));
     let (tx, _) = broadcast::channel(4096);
     Ok(Arc::new(App {
         ts,
+        ha,
         origin: store.origin().to_string(),
         log_key: store.public_key(),
         store: Mutex::new(store),
@@ -195,6 +203,19 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f)
         .await
         .expect("blocking task panicked")
+}
+
+/// A write this server cannot take now (lost the writer race, or a standby): 503 and
+/// `Retry-After`, so clients and load balancers retry, with the same idempotency key.
+fn retryable(e: &StoreError) -> Response {
+    let mut r = (StatusCode::SERVICE_UNAVAILABLE, store_error(e)).into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    r
 }
 
 fn store_error(e: &StoreError) -> String {
@@ -361,6 +382,8 @@ pub fn router(app: Shared) -> Router {
         .route("/api/v2/ts/flush", any(ts::flush))
         .route("/api/v2/ts/expire", any(ts::expire))
         .route("/api/v2/ts/proof", any(ts::proof))
+        .route("/health/writer", get(ha::health_writer))
+        .route("/health/ready", get(ha::health_ready))
         .route("/tlog/checkpoint", get(tlog_checkpoint))
         .route("/tlog/key", get(tlog_key))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
@@ -557,6 +580,23 @@ async fn write_events(
     if let Err(r) = authorize(&app, &headers, Scope::Write) {
         return r;
     }
+    if app.store.lock().unwrap().is_standby() {
+        return retryable(&StoreError::NotWriter);
+    }
+    // Idempotency-Key: a retried request (same key, same body) gets the original answer
+    let idem = match headers.get("idempotency-key").map(|v| v.to_str()) {
+        None => None,
+        Some(Ok(k)) if !k.is_empty() && k.len() <= 256 => Some(vesdb_core::objects::IdemRecord {
+            key: k.to_string(),
+            request: hex::encode(vesdb_core::sha256(&[&body])),
+        }),
+        Some(_) => {
+            return status(
+                StatusCode::BAD_REQUEST,
+                "Idempotency-Key must be 1 to 256 visible characters",
+            )
+        }
+    };
     let wb: WriteBody = match parse_body(&headers, &body) {
         Ok(b) => b,
         Err(r) => return r,
@@ -587,7 +627,7 @@ async fn write_events(
         .collect();
     let app2 = app.clone();
     let rt = tokio::runtime::Handle::current();
-    let res: Result<Result<Vec<vesdb_store::StoredEvent>, StoreError>, Response> =
+    let res: Result<Result<(Vec<vesdb_store::StoredEvent>, bool), StoreError>, Response> =
         blocking(move || {
             // the whole check-then-write runs under the store lock: other writes wait (as in EventSourcingDB)
             let mut s = app2.store.lock().unwrap();
@@ -623,12 +663,15 @@ async fn write_events(
                     }
                 }
             }
-            Ok(s.write(now_ns(), cands, &store_pcs).and_then(|(metas, _)| {
-                metas
-                    .iter()
-                    .map(|m| s.event(m.id))
-                    .collect::<Result<Vec<_>, _>>()
-            }))
+            Ok(s.write_ext(now_ns(), cands, &store_pcs, idem)
+                .and_then(|o| {
+                    let evs = o
+                        .events
+                        .iter()
+                        .map(|m| s.event(m.id))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((evs, o.replayed))
+                }))
         })
         .await;
     let res = match res {
@@ -636,14 +679,22 @@ async fn write_events(
         Err(resp) => return resp,
     };
     match res {
-        Ok(evs) => {
+        Ok((evs, replayed)) => {
             let mut out = String::new();
             for e in &evs {
                 out += &event_line(&app, e);
-                let _ = app.new_events.send(e.meta.id);
+                if !replayed {
+                    let _ = app.new_events.send(e.meta.id);
+                }
             }
-            ndjson(out + &wire::end())
+            let mut r = ndjson(out + &wire::end());
+            if replayed {
+                r.headers_mut()
+                    .insert("idempotent-replayed", HeaderValue::from_static("true"));
+            }
+            r
         }
+        Err(e) if e.retryable() => retryable(&e),
         Err(e) => ndjson(store_error(&e)),
     }
 }
@@ -1325,6 +1376,9 @@ pub async fn checkpoint_round(app: &Shared) {
     let app2 = app.clone();
     let cp = blocking(move || {
         let mut s = app2.store.lock().unwrap();
+        if s.is_standby() {
+            return None; // only the writer signs checkpoints
+        }
         let wk: Vec<PublicKey> = app2.cfg.witnesses.iter().map(|w| w.key.clone()).collect();
         let n = s.len();
         let last = s.checkpoints().last().cloned();

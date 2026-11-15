@@ -1,0 +1,39 @@
+[package]
+name = "vesdb-server"
+description = "vesdb HTTP server: EventSourcingDB v2-compatible API plus transparency-log endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vesdb"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vesdb-core.workspace = true
+vesdb-store.workspace = true
+vesdb-eventql = { path = "../vesdb-eventql" }
+vesdb-ts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+vesdb-witness.workspace = true
+eventsourcingdb = "=4.1.4"
+url = "2"
+ed25519-dalek.workspace = true

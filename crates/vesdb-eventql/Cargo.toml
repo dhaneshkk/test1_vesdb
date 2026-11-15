@@ -1,0 +1,17 @@
+[package]
+name = "vesdb-eventql"
+description = "EventQL compiled to Apache DataFusion logical plans"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+datafusion = { version = "55", default-features = false, features = ["datetime_expressions", "string_expressions", "unicode_expressions", "math_expressions", "recursive_protection"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+vesdb-core.workspace = true
+stacker = "0.1.25"

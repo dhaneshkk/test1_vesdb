@@ -1,0 +1,20 @@
+[package]
+name = "vesdb-verify"
+description = "Offline verifier for vesdb evidence bundles and checkpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vesdb-verify"
+path = "src/main.rs"
+
+[dependencies]
+vesdb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+hex.workspace = true
+sha2.workspace = true

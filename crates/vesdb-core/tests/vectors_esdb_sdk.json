@@ -1,0 +1,14 @@
+[
+ {
+  "name": "V2_EVENT",
+  "raw": "{\"source\":\"https://library.eventsourcingdb.io\",\"subject\":\"/books/42\",\"type\":\"io.eventsourcingdb.library.book-acquired\",\"specversion\":\"1.0\",\"id\":\"0\",\"time\":\"2026-10-18T13:47:38.717047673Z\",\"datacontenttype\":\"application/json\",\"predecessorhash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"data\":{\"author\":\"Arthur C. Clarke\",\"isbn\":\"978-0756906788\",\"pages\":297,\"title\":\"2001 – A Space Odyssey\"},\"hash\":\"esdb:hash:v2:3d63b75e107cb78d9f6c4b3556a4759f8bfa0130d52a5cec7c37ff414114a909\",\"signature\":null}"
+ },
+ {
+  "name": "V2_EVENT_WITH_TRACE_INFO",
+  "raw": "{\"source\":\"https://library.eventsourcingdb.io\",\"subject\":\"/books/42\",\"type\":\"io.eventsourcingdb.library.book-borrowed\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\",\"specversion\":\"1.0\",\"id\":\"1\",\"time\":\"2026-10-18T13:47:38.717047673Z\",\"datacontenttype\":\"application/json\",\"predecessorhash\":\"esdb:hash:v2:3d63b75e107cb78d9f6c4b3556a4759f8bfa0130d52a5cec7c37ff414114a909\",\"data\":{\"borrower\":\"/readers/23\"},\"hash\":\"esdb:hash:v2:5dd01d299b0cd74be15e861c2ffaffdbebd5dec4daf59e0aeacc2de3919d72aa\",\"signature\":null}"
+ },
+ {
+  "name": "V2_EVENT_WITH_TRACEPARENT",
+  "raw": "{\"source\":\"https://library.eventsourcingdb.io\",\"subject\":\"/books/42\",\"type\":\"io.eventsourcingdb.library.book-returned\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"specversion\":\"1.0\",\"id\":\"2\",\"time\":\"2026-10-18T13:47:38.717047673Z\",\"datacontenttype\":\"application/json\",\"predecessorhash\":\"esdb:hash:v2:5dd01d299b0cd74be15e861c2ffaffdbebd5dec4daf59e0aeacc2de3919d72aa\",\"data\":{},\"hash\":\"esdb:hash:v2:ef4714fbca2006ec2f7d7d8ae07538d0c40409ddf7c720d2f60335ea5bb57d16\",\"signature\":null}"
+ }
+]

@@ -1,0 +1,25 @@
+[package]
+name = "vesdb-witness"
+description = "vesdb witness: cosigns checkpoints that provably extend what it saw before"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vesdb-witness"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vesdb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

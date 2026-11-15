@@ -1,0 +1,19 @@
+[package]
+name = "vesdb-store"
+description = "vesdb storage engine: append-only segments, single-writer sequencer, preconditions, receipts, redaction, integrity verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vesdb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
